@@ -557,8 +557,7 @@ class OAuth2Validator(RequestValidator):
         """
         return oauth2_settings.ROTATE_REFRESH_TOKEN
 
-    @transaction.atomic
-    def save_bearer_token(self, token, request, *args, **kwargs):
+    def save_bearer_token(self, token, request, *args, using=None, **kwargs):
         """
         Save access and refresh token, If refresh token is issued, remove or
         reuse old refresh token as in rfc:`6`
@@ -566,97 +565,98 @@ class OAuth2Validator(RequestValidator):
         @see: https://rfc-editor.org/rfc/rfc6749.html#section-6
         """
 
-        if "scope" not in token:
-            raise FatalClientError("Failed to renew access token: missing scope")
+        with transaction.atomic(using=using):
+            if "scope" not in token:
+                raise FatalClientError("Failed to renew access token: missing scope")
 
-        # expires_in is passed to Server on initialization
-        # custom server class can have logic to override this
-        expires = timezone.now() + timedelta(
-            seconds=token.get(
-                "expires_in",
-                oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS,
-            )
-        )
-
-        if request.grant_type == "client_credentials":
-            request.user = None
-
-        # This comes from OAuthLib:
-        # https://github.com/idan/oauthlib/blob/1.0.3/oauthlib/oauth2/rfc6749/tokens.py#L267
-        # Its value is either a new random code; or if we are reusing
-        # refresh tokens, then it is the same value that the request passed in
-        # (stored in `request.refresh_token`)
-        refresh_token_code = token.get("refresh_token", None)
-
-        if refresh_token_code:
-            # an instance of `RefreshToken` that matches the old refresh code.
-            # Set on the request in `validate_refresh_token`
-            refresh_token_instance = getattr(request, "refresh_token_instance", None)
-
-            # If we are to reuse tokens, and we can: do so
-            if (
-                not self.rotate_refresh_token(request)
-                and isinstance(refresh_token_instance, RefreshToken)
-                and refresh_token_instance.access_token
-            ):
-                access_token = AccessToken.objects.select_for_update().get(
-                    pk=refresh_token_instance.access_token.pk
+            # expires_in is passed to Server on initialization
+            # custom server class can have logic to override this
+            expires = timezone.now() + timedelta(
+                seconds=token.get(
+                    "expires_in",
+                    oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS,
                 )
-                access_token.user = request.user
-                access_token.scope = token["scope"]
-                access_token.expires = expires
-                access_token.token = token["access_token"]
-                access_token.application = request.client
-                access_token.save()
+            )
 
-            # else create fresh with access & refresh tokens
-            else:
-                # revoke existing tokens if possible to allow reuse of grant
-                if isinstance(refresh_token_instance, RefreshToken):
-                    # First, to ensure we don't have concurrency issues, we refresh the refresh token
-                    # from the db while acquiring a lock on it
-                    # We also put it in the "request cache"
-                    refresh_token_instance = RefreshToken.objects.select_for_update().get(
-                        id=refresh_token_instance.id
+            if request.grant_type == "client_credentials":
+                request.user = None
+
+            # This comes from OAuthLib:
+            # https://github.com/idan/oauthlib/blob/1.0.3/oauthlib/oauth2/rfc6749/tokens.py#L267
+            # Its value is either a new random code; or if we are reusing
+            # refresh tokens, then it is the same value that the request passed in
+            # (stored in `request.refresh_token`)
+            refresh_token_code = token.get("refresh_token", None)
+
+            if refresh_token_code:
+                # an instance of `RefreshToken` that matches the old refresh code.
+                # Set on the request in `validate_refresh_token`
+                refresh_token_instance = getattr(request, "refresh_token_instance", None)
+
+                # If we are to reuse tokens, and we can: do so
+                if (
+                    not self.rotate_refresh_token(request)
+                    and isinstance(refresh_token_instance, RefreshToken)
+                    and refresh_token_instance.access_token
+                ):
+                    access_token = AccessToken.objects.select_for_update().get(
+                        pk=refresh_token_instance.access_token.pk
                     )
-                    request.refresh_token_instance = refresh_token_instance
+                    access_token.user = request.user
+                    access_token.scope = token["scope"]
+                    access_token.expires = expires
+                    access_token.token = token["access_token"]
+                    access_token.application = request.client
+                    access_token.save()
 
-                    previous_access_token = AccessToken.objects.filter(
-                        source_refresh_token=refresh_token_instance
-                    ).first()
-                    try:
-                        refresh_token_instance.revoke()
-                    except (AccessToken.DoesNotExist, RefreshToken.DoesNotExist):
-                        pass
+                # else create fresh with access & refresh tokens
+                else:
+                    # revoke existing tokens if possible to allow reuse of grant
+                    if isinstance(refresh_token_instance, RefreshToken):
+                        # First, to ensure we don't have concurrency issues, we refresh the refresh token
+                        # from the db while acquiring a lock on it
+                        # We also put it in the "request cache"
+                        refresh_token_instance = RefreshToken.objects.select_for_update().get(
+                            id=refresh_token_instance.id
+                        )
+                        request.refresh_token_instance = refresh_token_instance
+
+                        previous_access_token = AccessToken.objects.filter(
+                            source_refresh_token=refresh_token_instance
+                        ).first()
+                        try:
+                            refresh_token_instance.revoke()
+                        except (AccessToken.DoesNotExist, RefreshToken.DoesNotExist):
+                            pass
+                        else:
+                            setattr(request, "refresh_token_instance", None)
                     else:
-                        setattr(request, "refresh_token_instance", None)
-                else:
-                    previous_access_token = None
+                        previous_access_token = None
 
-                # If the refresh token has already been used to create an
-                # access token (ie it's within the grace period), return that
-                # access token
-                if not previous_access_token:
-                    access_token = self._create_access_token(
-                        expires,
-                        request,
-                        token,
-                        source_refresh_token=refresh_token_instance,
-                    )
+                    # If the refresh token has already been used to create an
+                    # access token (ie it's within the grace period), return that
+                    # access token
+                    if not previous_access_token:
+                        access_token = self._create_access_token(
+                            expires,
+                            request,
+                            token,
+                            source_refresh_token=refresh_token_instance,
+                        )
 
-                    self._create_refresh_token(request, refresh_token_code, access_token)
-                else:
-                    # make sure that the token data we're returning matches
-                    # the existing token
-                    token["access_token"] = previous_access_token.token
-                    token["refresh_token"] = (
-                        RefreshToken.objects.filter(access_token=previous_access_token).first().token
-                    )
-                    token["scope"] = previous_access_token.scope
+                        self._create_refresh_token(request, refresh_token_code, access_token)
+                    else:
+                        # make sure that the token data we're returning matches
+                        # the existing token
+                        token["access_token"] = previous_access_token.token
+                        token["refresh_token"] = (
+                            RefreshToken.objects.filter(access_token=previous_access_token).first().token
+                        )
+                        token["scope"] = previous_access_token.scope
 
-        # No refresh token should be created, just access token
-        else:
-            self._create_access_token(expires, request, token)
+            # No refresh token should be created, just access token
+            else:
+                self._create_access_token(expires, request, token)
 
     def _create_access_token(self, expires, request, token, source_refresh_token=None):
         id_token = token.get("id_token", None)
@@ -770,18 +770,18 @@ class OAuth2Validator(RequestValidator):
         request.refresh_token_instance = rt
         return rt.application == client
 
-    @transaction.atomic
-    def _save_id_token(self, jti, request, expires, *args, **kwargs):
-        scopes = request.scope or " ".join(request.scopes)
+    def _save_id_token(self, jti, request, expires, *args, using=None, **kwargs):
+        with transaction.atomic(using=using):
+            scopes = request.scope or " ".join(request.scopes)
 
-        id_token = IDToken.objects.create(
-            user=request.user,
-            scope=scopes,
-            expires=expires,
-            jti=jti,
-            application=request.client,
-        )
-        return id_token
+            id_token = IDToken.objects.create(
+                user=request.user,
+                scope=scopes,
+                expires=expires,
+                jti=jti,
+                application=request.client,
+            )
+            return id_token
 
     @classmethod
     def _get_additional_claims_is_request_agnostic(cls):
